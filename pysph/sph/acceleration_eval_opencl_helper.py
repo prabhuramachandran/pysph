@@ -69,8 +69,13 @@ class OpenCLAccelerationEval(object):
         args = list(info.get('args'))
         dest = info['dest']
         n = dest.get_number_of_particles(info.get('real', True))
-        args[1] = (n,)
-        args[3:] = [x() for x in args[3:]]
+        queue = self._queue
+        max_wg_sz = call.get_work_group_info(
+            cl.kernel_work_group_info.WORK_GROUP_SIZE, queue.device
+        )
+        gs, ls = cl.array.splay(queue, n, max_wg_sz)
+        args[1:4] = gs, ls, np.array([n], np.int64)
+        args[4:] = [x() for x in args[4:]]
         if info.get('loop'):
             nnps.set_context(info['src_idx'], info['dst_idx'])
             cache = nnps.current_cache
@@ -252,7 +257,7 @@ class AccelerationEvalOpenCLHelper(object):
                 method = getattr(prg, kernel)
                 dest = item['dest']
                 src = item.get('source', dest)
-                args = [self._queue, None, None]
+                args = [self._queue, None, None, None]
                 for arg in item['args']:
                     args.append(self._get_argument(arg, dest, src))
                 loop = item['loop']
@@ -368,10 +373,14 @@ class AccelerationEvalOpenCLHelper(object):
         kernel = 'g{g_idx}{sub}_{dest}_{kind}'.format(
             g_idx=g_idx, sub=sub_grp, dest=dest, kind=kind
         )
-        all_args = []
+        all_args = ['long n']
         py_args = []
         code = [
-            'int d_idx = get_global_id(0);'
+            'int lid = get_local_id(0);',
+            'int gsize = get_global_size(0);',
+            'int work_group_start = get_local_size(0)*get_group_id(0);',
+            'long d_idx;',
+            'for (d_idx = work_group_start + lid; d_idx < n; d_idx += gsize) {'
         ]
         for eq in all_eqs.equations:
             method = getattr(eq, kind, None)
@@ -392,9 +401,10 @@ class AccelerationEvalOpenCLHelper(object):
                         '{cls}_{kind}({args});'.format(
                             cls=cls, kind=kind, args=', '.join(call_args)
                         ),
-                        indent=''
+                        indent=' '*4
                     )
                 )
+        code.append('}')
         s_ary, d_ary = all_eqs.get_array_names()
         # We only need the dest arrays here as these are simple kernels
         # without a loop so there is no "source".
@@ -483,21 +493,27 @@ class AccelerationEvalOpenCLHelper(object):
         )
         context = eq_group.context
         code = self._declare_precomp_vars(context)
-        code.append('int d_idx = get_global_id(0);')
-        code.append('int s_idx, i;')
-        code.append('int start = start_idx[d_idx];')
-        code.append('int end = start + nbr_length[d_idx];')
-        code.append('for (i=start; i<end; i++) {')
-        code.append('    s_idx = neighbors[i];')
+        code += [
+            'int lid = get_local_id(0);',
+            'int gsize = get_global_size(0);',
+            'int work_group_start = get_local_size(0)*get_group_id(0);',
+            'long d_idx, s_idx, i;',
+            'long start, end;',
+            'for (d_idx = work_group_start + lid; d_idx < n; d_idx += gsize) {'
+            '    start = start_idx[d_idx];',
+            '    end = start + nbr_length[d_idx];',
+            '    for (i=start; i<end; i++) {',
+            '        s_idx = neighbors[i];',
+        ]
         pre = []
         for p, cb in eq_group.precomputed.items():
             src = cb.code.strip().splitlines()
-            pre.extend([' '*4 + x + ';' for x in src])
+            pre.extend([' '*8 + x + ';' for x in src])
         if len(pre) > 0:
             pre.append('')
         code.extend(pre)
 
-        all_args = []
+        all_args = ['long n']
         py_args = []
         for eq in eq_group.equations:
             method = getattr(eq, kind, None)
@@ -518,9 +534,11 @@ class AccelerationEvalOpenCLHelper(object):
                         '{cls}_{kind}({args});'.format(
                             cls=cls, kind=kind, args=', '.join(call_args)
                         ),
-                        indent='    '
+                        indent=' '*8
                     )
                 )
+
+        code.append(' '*8 + '}')
 
         s_ary, d_ary = eq_group.get_array_names()
         s_ary.update(d_ary)
