@@ -154,9 +154,13 @@ class OpenCLAccelerationEval(object):
         args = list(info.get('args'))
         dest = info['dest']
         n = dest.get_number_of_particles(info.get('real', True))
-        args[1] = (n,)
-        args[3:] = [x() for x in args[3:]]
-
+        queue = self._queue
+        max_wg_sz = call.get_work_group_info(
+            cl.kernel_work_group_info.WORK_GROUP_SIZE, queue.device
+        )
+        gs, ls = cl.array.splay(queue, n, max_wg_sz)
+        args[1:4] = gs, ls, np.array([n], np.int64)
+        args[4:] = [x() for x in args[4:]]
         if info.get('loop'):
             if self._use_local_memory:
                 nnps.set_context(info['src_idx'], info['dst_idx'])
@@ -366,7 +370,7 @@ class AccelerationEvalOpenCLHelper(object):
                 method = profile_kernel(method, method.function_name)
                 dest = item['dest']
                 src = item.get('source', dest)
-                args = [self._queue, None, None]
+                args = [self._queue, None, None, None]
                 for arg in item['args']:
                     args.append(self._get_argument(arg, dest, src))
                 loop = item['loop']
@@ -513,14 +517,19 @@ class AccelerationEvalOpenCLHelper(object):
 
         sph_k_name = self.object.kernel.__class__.__name__
         code = [
-            'int d_idx = get_global_id(0);'
-            '__global %s* SPH_KERNEL = kern;' % sph_k_name
+            '__global %s* SPH_KERNEL = kern;' % sph_k_name,
+            'int lid = get_local_id(0);',
+            'int gsize = get_global_size(0);',
+            'int work_group_start = get_local_size(0)*get_group_id(0);',
+            'long d_idx;',
+            'for (d_idx = work_group_start + lid; d_idx < n; d_idx += gsize) {'
         ]
         all_args, py_args, _calls = self._get_equation_method_calls(
-            all_eqs, kind, indent=''
+            all_eqs, kind, indent=' '*4
         )
         code.extend(_calls)
 
+        code.append('}')
         s_ary, d_ary = all_eqs.get_array_names()
         if source is None:
             # We only need the dest arrays here as these are simple kernels
@@ -550,7 +559,7 @@ class AccelerationEvalOpenCLHelper(object):
         )
 
     def _get_equation_method_calls(self, eq_group, kind, indent=''):
-        all_args = []
+        all_args = ['long n']
         py_args = []
         code = []
         for eq in eq_group.equations:
@@ -674,31 +683,42 @@ class AccelerationEvalOpenCLHelper(object):
         context = eq_group.context
         all_args, py_args = [], []
         code = self._declare_precomp_vars(context)
-        code.append('unsigned int d_idx = get_global_id(0);')
-        code.append('unsigned int s_idx, i;')
-        code.append('__global %s* SPH_KERNEL = kern;' % sph_k_name)
-        code.append('unsigned int start = start_idx[d_idx];')
-        code.append('__global unsigned int* NBRS = &(neighbors[start]);')
-        code.append('int N_NBRS = nbr_length[d_idx];')
-        code.append('unsigned int end = start + N_NBRS;')
+
+        code += [
+            '__global %s* SPH_KERNEL = kern;' % sph_k_name,
+            'unsigned int lid = get_local_id(0);',
+            'unsigned int gsize = get_global_size(0);',
+            'unsigned int work_group_start = get_local_size(0)*get_group_id(0);',
+            'unsigned int d_idx, s_idx, i;',
+            'unsigned int start, end;',
+            '__global unsigned int* NBRS;',
+            'unsigned int N_NBRS;'
+            'for (d_idx = work_group_start + lid; d_idx < n; d_idx += gsize) {'
+            '    start = start_idx[d_idx];',
+            '    N_NBRS = nbr_length[d_idx];',
+            '    end = start + N_NBRS;',
+            '    NBRS = &(neighbors[start]);',
+        ]
         if eq_group.has_loop_all():
             _all_args, _py_args, _calls = self._get_equation_method_calls(
-                eq_group, kind='loop_all', indent=''
+                eq_group, kind='loop_all', indent=' '*4
             )
             code.extend(['', '// Calling loop_all of equations.'])
             code.extend(_calls)
             code.append('')
+            code.append('}')
+
             all_args.extend(_all_args)
             py_args.extend(_py_args)
 
         if eq_group.has_loop():
-            code.append('// Calling loop of equations.')
-            code.append('for (i=start; i<end; i++) {')
-            code.append('    s_idx = neighbors[i];')
+            code.append('    // Calling loop of equations.')
+            code.append('    for (i=start; i<end; i++) {')
+            code.append('        s_idx = neighbors[i];')
             pre = []
             for p, cb in eq_group.precomputed.items():
                 src = cb.code.strip().splitlines()
-                pre.extend([' ' * 4 + x + ';' for x in src])
+                pre.extend([' ' * 8 + x + ';' for x in src])
             if len(pre) > 0:
                 pre.append('')
             code.extend(pre)
@@ -711,6 +731,8 @@ class AccelerationEvalOpenCLHelper(object):
                 if arg not in all_args:
                     all_args.append(arg)
                     py_args.append(py_arg)
+            code.append(' '*4 + '}')
+            code.append('')
             code.append('}')
 
         s_ary, d_ary = eq_group.get_array_names()
