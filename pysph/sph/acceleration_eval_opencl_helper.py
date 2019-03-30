@@ -524,9 +524,11 @@ class AccelerationEvalOpenCLHelper(object):
             'long d_idx;',
             'for (d_idx = work_group_start + lid; d_idx < n; d_idx += gsize) {'
         ]
-        all_args, py_args, _calls = self._get_equation_method_calls(
+        all_args = ['long n']
+        _all_args, py_args, _calls = self._get_equation_method_calls(
             all_eqs, kind, indent=' '*4
         )
+        all_args.extend(_all_args)
         code.extend(_calls)
 
         code.append('}')
@@ -559,7 +561,7 @@ class AccelerationEvalOpenCLHelper(object):
         )
 
     def _get_equation_method_calls(self, eq_group, kind, indent=''):
-        all_args = ['long n']
+        all_args = []
         py_args = []
         code = []
         for eq in eq_group.equations:
@@ -681,7 +683,7 @@ class AccelerationEvalOpenCLHelper(object):
         )
         sph_k_name = self.object.kernel.__class__.__name__
         context = eq_group.context
-        all_args, py_args = [], []
+        all_args, py_args = ['long n'], []
         code = self._declare_precomp_vars(context)
 
         code += [
@@ -693,7 +695,7 @@ class AccelerationEvalOpenCLHelper(object):
             'unsigned int start, end;',
             '__global unsigned int* NBRS;',
             'unsigned int N_NBRS;'
-            'for (d_idx = work_group_start + lid; d_idx < n; d_idx += gsize) {'
+            'for (d_idx = work_group_start + lid; d_idx < n; d_idx += gsize) {',
             '    start = start_idx[d_idx];',
             '    N_NBRS = nbr_length[d_idx];',
             '    end = start + N_NBRS;',
@@ -712,6 +714,7 @@ class AccelerationEvalOpenCLHelper(object):
             py_args.extend(_py_args)
 
         if eq_group.has_loop():
+            code.append('')
             code.append('    // Calling loop of equations.')
             code.append('    for (i=start; i<end; i++) {')
             code.append('        s_idx = neighbors[i];')
@@ -724,7 +727,7 @@ class AccelerationEvalOpenCLHelper(object):
             code.extend(pre)
 
             _all_args, _py_args, _calls = self._get_equation_method_calls(
-                eq_group, kind, indent='    '
+                eq_group, kind, indent=' '*8
             )
             code.extend(_calls)
             for arg, py_arg in zip(_all_args, _py_args):
